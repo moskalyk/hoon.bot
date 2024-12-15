@@ -5,10 +5,12 @@ const bodyParser = require('body-parser');
 const fs = require('fs/promises');
 const path = require('path');
 const fetch = require('cross-fetch');
+const cors = require('cors')
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(express.json());
+app.use(cors());
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -210,7 +212,7 @@ const validatePhoneNumber = (req, res, next) => {
 };
 
 // Signup route
-router.post('/signup', validatePhoneNumber, async (req, res) => {
+router.post('/join', validatePhoneNumber, async (req, res) => {
   const { phoneNumber } = req.body;
   
   try {
@@ -238,32 +240,24 @@ router.post('/signup', validatePhoneNumber, async (req, res) => {
     const welcomeMessage = 
       "howdy, welcome to hoon bot\n\n" +
 
-      "text us with a command to program us to return May ‘24 hoon academy nuggets, timely\n\n" +
+      "text us with a command to program us to respond with may ‘24 hoon academy nuggets, timely\n\n" +
 
       "the default is all the sessions (0-8), hourly \n\n" +
-      "Available commands:\n" +
-      `
-      :begin - Start receiving messages
-      :begin [hours] - Start for specific duration
-      :stop - Stop messages
-      :stop in/for [hours] - Schedule stop
-      :sync [hours...] - Set hourly message intervals, e.g. :sync 1 2 1 
-      :slow [0-30] - Reduce message frequency
-      :lessons [numbers] - Select which lessons to receive (0-8)
-      :help - Show this message\n
-      `+
-      "Your first nugget will arrive shortly!";
+      "available commands:\n" +
+`
+:begin - start receiving messages
+:begin [hours] - start for specific duration
+:stop - stop messages
+:stop in/for [hours] - schedule stop
+:sync [hours...] - set hourly message intervals, e.g. :sync 1 2 1 
+:slow [0-30] - reduce message frequency
+:lessons [numbers] - select which lessons to receive (0-8)
+:help - show this message\n
+`+
+"your first nugget will arrive shortly!";
 
     await client.messages.create({
       body: welcomeMessage,
-      to: phoneNumber,
-      from: twilioNumber
-    });
-
-    // Send first content immediately
-    const content = await fetchArenaContent(db.users[phoneNumber].lessonWeights);
-    await client.messages.create({
-      body: `Here's your first Hoon Academy nugget: ${content.url}`,
       to: phoneNumber,
       from: twilioNumber
     });
@@ -316,57 +310,133 @@ router.get('/status/:phoneNumber', validatePhoneNumber, async (req, res) => {
 app.use('/api', router);
 
 // Message handling endpoint
-app.post('/sms', async (req, res) => {
+// First, extract the signup logic into a reusable function
+async function handleSignup(phoneNumber) {
+  try {
+    // Check if user already exists
+    const db = await readDatabase();
+    if (db.users[phoneNumber]) {
+      return "you're already registered. text :help for available commands.";
+    }
+
+    // Initialize user in database with default settings
+    db.users[phoneNumber] = {
+      active: true,
+      sendIntervals: [3600000], // Default 1 hour
+      lessonWeights: Array(9).fill(1), // All lessons enabled by default
+      messageCount: 0,
+      nextSendTime: Date.now(),
+      currentIntervalIndex: 0
+    };
+    
+    await writeDatabase(db);
+
+    const welcomeMessage = 
+      "howdy, welcome to hoon bot\n\n" +
+
+      "text us with a command to program us to respond with may ‘24 hoon academy nuggets, timely\n\n" +
+
+      "the default is all the sessions (0-8), hourly \n\n" +
+      "available commands:\n" +
+      `
+:begin - start receiving messages
+:begin [hours] - start for specific duration
+:stop - stop messages
+:stop in/for [hours] - schedule stop
+:sync [hours...] - set hourly message intervals, e.g. :sync 1 2 1 
+:slow [0-30] - reduce message frequency
+:lessons [numbers] - select which lessons to receive (0-8)
+:help - show this message\n
+`+
+"your first nugget will arrive shortly!";
+
+    return welcomeMessage
+  } catch (error) {
+    console.error('Signup error:', error);
+    return "sorry, there was an error processing your signup. please try again later.";
+  }
+}
+
+const validateWebhook = (req, res, next) => {
+  const params = req.body;
+  if (params.AccountSid == process.env.TWILIO_ACCOUNT_SID) {
+    next();
+  } else {
+    res.status(403).send('Invalid Twilio signature');
+  }
+};
+
+// Updated SMS handler
+app.post('/sms', validateWebhook, async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
   const { Body: message, From: phoneNumber } = req.body;
+  
+  // Normalize the message by removing ':' if present and converting to lowercase
+  let normalizedMessage = message.toLowerCase().replace(':', '');
+  normalizedMessage = normalizedMessage.toLowerCase().replace(' ', '');
 
-  if (message.toLowerCase() === 'yes' || message.toLowerCase() === 'no') {
-    const db = await readDatabase();
-    if (db.users[phoneNumber]?.messageCount >= 100) {
-      if (message.toLowerCase() === 'yes') {
-        db.users[phoneNumber].sendIntervals = db.users[phoneNumber].sendIntervals.map(
-          interval => interval * 2
-        );
-        await writeDatabase(db);
-        twiml.message('Message frequency has been reduced by half.');
-      } else {
-        twiml.message('Continuing with current frequency.');
+  try {
+    let response;
+    
+    // Handle join command first
+    if (normalizedMessage === 'join') {
+      console.log('join')
+      response = await handleSignup(phoneNumber);
+    }
+    // Handle yes/no responses
+    else if (normalizedMessage === 'yes' || normalizedMessage === 'no') {
+      const db = await readDatabase();
+      if (db.users[phoneNumber]?.messageCount >= 100) {
+        if (normalizedMessage === 'yes') {
+          db.users[phoneNumber].sendIntervals = db.users[phoneNumber].sendIntervals.map(
+            interval => interval * 2
+          );
+          await writeDatabase(db);
+          response = 'message frequency has been reduced by half.';
+        } else {
+          response = 'continuing with current frequency.';
+        }
       }
     }
-  } else if (message.startsWith(':')) {
-    const [command, ...params] = message.slice(1).split(' ');
-    let response;
-
-    switch (command) {
-      case 'begin':
-        response = await handleBegin(phoneNumber, params);
-        break;
-      case 'stop':
-        response = await handleStop(phoneNumber, params);
-        break;
-      case 'sync':
-        response = await handleSync(phoneNumber, params);
-        break;
-      case 'slow':
-        response = await handleSlow(phoneNumber, params);
-        break;
-      case 'lessons':
-        response = await handleLessons(phoneNumber, params);
-        break;
-      case 'help':
-        response = HELP_MESSAGE;
-        break;
-      default:
-        response = "Unknown command. Text :help for available commands.";
+    // Handle other commands
+    else if (message.startsWith(':')) {
+      const [command, ...params] = message.slice(1).split(' ');
+      switch (command) {
+        case 'begin':
+          response = await handleBegin(phoneNumber, params);
+          break;
+        case 'stop':
+          response = await handleStop(phoneNumber, params);
+          break;
+        case 'sync':
+          response = await handleSync(phoneNumber, params);
+          break;
+        case 'slow':
+          response = await handleSlow(phoneNumber, params);
+          break;
+        case 'lessons':
+          response = await handleLessons(phoneNumber, params);
+          break;
+        case 'help':
+          response = HELP_MESSAGE;
+          break;
+        default:
+          response = "unknown command. text :help for available commands.";
+      }
+    }
+    else {
+      response = "unknown command. text 'join' to start or :help for available commands.";
     }
 
     twiml.message(response);
-  } else {
-    twiml.message('Unknown command. Text :help for available commands.');
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml.toString());
+  } catch (error) {
+    console.error('SMS handling error:', error);
+    twiml.message('An error occurred. Please try again later.');
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml.toString());
   }
-
-  res.writeHead(200, { 'Content-Type': 'text/xml' });
-  res.end(twiml.toString());
 });
 
 // Message sending function
@@ -384,7 +454,7 @@ async function sendScheduledMessages() {
       try {
         const content = await fetchArenaContent(user.lessonWeights);
         await client.messages.create({
-          body: `Here's your Hoon Academy nugget: ${content.url}`,
+          body: `here's your hoon academy nugget: ${content.url}`,
           to: phoneNumber,
           from: twilioNumber
         });
@@ -397,7 +467,7 @@ async function sendScheduledMessages() {
 
         if (user.messageCount === 100) {
           await client.messages.create({
-            body: "You've gotten 100 tid bits of knowledge, want to slow down? respond with yes or no",
+            body: "you've gotten 100 tid bits of knowledge, want to slow down? respond with yes or no",
             to: phoneNumber,
             from: twilioNumber
           });
